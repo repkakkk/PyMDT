@@ -1,4 +1,12 @@
-# Status: Archived
+# JupyterMDT
+
+This is a fork of PyMDT repository by [Sylvain Martin] (https://github.com/symartin)
+
+It can read MDT-files, make simple processing of frames and create quick .docx and .html digests
+
+# PyMDT Readme
+
+## Status: Archived
 This repository has been archived and is no longer maintained.
 
 ![status: inactive](https://img.shields.io/badge/status-inactive-red.svg)

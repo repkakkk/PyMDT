@@ -96,23 +96,93 @@ class MDTFile(list):
         def __getattr__(self, attr):
             return getattr(self._file, attr)
 
-    def __init__(self, mdt_file = None):
+
+    def __init__(self):
+        # system and file ptr stuff
+        self.frm_byte_size = 0
+        self.frm_ptr_start = 0
+        self.data_size = 0
+
+        self.type = None
+        self.version = (0, 0)
+
+        self.title = ""
+        self.guids = ""
+
+        # the date
+        self.year = 0
+        self.month = 0
+        self.day = 0
+        self.hour = 0
+        self.min = 0
+        self.sec = 0
+
+        # all about data
+        self.data = None
+        self.data_corrected = None
+        self.metadata = ""
+
+        self.nb_dimensions = 0
+        self.dimensions = []
+        self.dimensions_unit = ""
+
+        self.nb_mesurands = 0
+        self.mesurands = []
+        self.mesurands_unit = ""
+
+        # 2D data specific
+        self.xn = 0
+        self.yn = 0
+        self.xbias = 0
+        self.ybias = 0
+        self.xreal = 0
+        self.yreal = 0
+
+        # Scanned frame specific attributes
+        self.x_scale = {}
+        self.y_scale = {}
+        self.z_scale = {}
+
+        self.channel_index = 0
+        self.mode = 0
+        self.xres = 0
+        self.yres = 0
+        self.ndacq = 0
+        self.step_length = 0
+        self.adt = 0
+        self.adc_gain_amp_log10 = 0
+        self.adc_index = 0
+        self.s16_version = 0
+        self.s17_pass_num = 0
+        self.scan_dir = 0
+        self.power_of_2 = False
+        self.velocity = 0
+        self.setpoint = 0
+        self.bias_voltage = 0
+        self.draw = False
+        self.xoff = 0
+        self.yoff = 0
+        self.nl_corr = False
+
+        # Frame mode attributes
+        self.fm_mode = 0
+        self.fm_xres = 0
+        self.fm_yres = 0
+        self.fm_ndots = 0
+
+    def print_header(self):
         """
-            initialise the object, and if mdt_file is a path to a mde file or a opened file object,
-            will read it and extract the data.
-
-            if mdt_file is an open file object, it has to be open in binary mode.
+        Print all the info load from the frame header
+        (for debug purpose).
         """
-
-        super().__init__()
-
-        self.nb_frame = 0
-
-        self._mdt_file_size    = 0
-        self._file             = self.__MDTBufferedReaderDecorator(None)
-
-        if mdt_file:
-            self.load_mdt_file(mdt_file)
+        logging.debug("--------------------------------------")
+        logging.debug("Frame start at byte %d" % self.frm_ptr_start)
+        logging.debug("frame frm_byte_size: " + str(self.frm_byte_size) + " bytes")
+        logging.debug("Frame version: " + str(self.version))
+        logging.debug("Frame datetime: %d-%02d-%02d %02d:%02d:%02d" %
+                     (self.year, self.month, self.day, self.hour, self.min, self.sec))
+        logging.debug("Frame type : " + str(self.type) + " -- " + str(MDTFrameType(self.type)))
+        logging.debug("--------------------------------------")
 
     def load_mdt_file(self, file):
         """
@@ -167,7 +237,9 @@ class MDTFile(list):
         self._extract_header(frame)
 
         if frame.type == MDTFrameType.MDT_FRAME_SCANNED:
-            logging.warning("Frame #%d: Frame STM not implemented yet." % num)
+            logging.info(f"Frame #{num} is a scanned frame")
+            self._extract_scanned_data(frame)
+            logging.info(f"--> Frame {frame.title} loaded")
 
         elif (frame.type == MDTFrameType.MDT_FRAME_SPECTROSCOPY or
                       frame.type == MDTFrameType.MDT_FRAME_CURVES):
@@ -539,9 +611,396 @@ class MDTFile(list):
             logging.debug(e)
             logging.warning('The data type in the frame %s is not supported' % frame.title)
 
+    def fix_overflow(self, data, threshold=32500):
+        """
+        Detect and fix overflow in raw AFM data.
+
+        Args:
+            data: numpy array of raw int16 values
+            threshold: values above this are considered overflow candidates
+
+        Returns:
+            Fixed data as float64
+        """
+        # Convert to float for processing
+        data_float = data.astype(np.float64)
+
+        # Make a copy to work with
+        data_fixed = data_float.copy()
+
+        # Method 1: Fix negative overflow (wrapping from 32767 to -32768)
+        negative_overflow_mask = data_float < -threshold
+        if np.any(negative_overflow_mask):
+            #logging.info(f"Fixing {np.sum(negative_overflow_mask)} negative overflow points")
+            # Add 65536 to negative values that are below -threshold
+            data_fixed[negative_overflow_mask] += 65536
+
+        # Method 2: Fix positive overflow (values > 32767 in unsigned interpretation)
+        # In signed 16-bit, values > 32767 appear as negative numbers
+        # But we've already handled negative ones, now look for sudden jumps
+
+        # Calculate differences between consecutive points
+        diff = np.diff(data_fixed)
+
+        # Look for large positive jumps (wrapping from high to low)
+        # When data wraps from ~65535 to 0, diff is ~ -65535
+        # When data wraps from 0 to 65535, diff is ~ +65535
+        wrap_down_indices = np.where(diff < -25000)[0]
+        wrap_up_indices = np.where(diff > 25000)[0]
+
+        # Fix wraps by adding 65536 after each wrap-down
+        for idx in wrap_down_indices:
+            if idx + 1 < len(data_fixed):
+                #logging.info(f"Fixing wrap-down at index {idx}, value={data_fixed[idx]:.0f} -> {data_fixed[idx+1]:.0f}")
+                # Add 65536 to all values after the wrap
+                data_fixed[idx + 1:] += 65536
+
+        # Fix wraps by subtracting 65536 after each wrap-up
+        for idx in wrap_up_indices:
+            if idx + 1 < len(data_fixed):
+                #logging.info(f"Fixing wrap-up at index {idx}, value={data_fixed[idx]:.0f} -> {data_fixed[idx+1]:.0f}")
+                # Subtract 65536 from all values after the wrap
+                data_fixed[idx + 1:] -= 65536
+
+        # Method 3: Handle isolated extreme values
+        # Look for values > threshold that are isolated
+        '''high_values = np.where(np.abs(data_fixed) > threshold)[0]
+
+        for idx in high_values:
+            # Skip if this is part of a continuous high region
+            if idx > 0 and idx < len(data_fixed) - 1:
+                left_val = data_fixed[idx - 1]
+                right_val = data_fixed[idx + 1]
+
+                # If neighbors are normal and this is an isolated spike
+                if (np.abs(left_val) < threshold and
+                    np.abs(right_val) < threshold and
+                    np.abs(data_fixed[idx]) > threshold * 1.5):
+
+                    logging.info(f"Fixing isolated spike at index {idx}: {data_fixed[idx]:.0f}")
+                    # Replace with average of neighbors
+                    data_fixed[idx] = (left_val + right_val) / 2
+'''
+
+        # Log statistics
+        final_min = np.min(data_fixed)
+        final_max = np.max(data_fixed)
+        final_range = final_max - final_min
+
+        #logging.info(f"Fixed data: min={final_min:.0f}, max={final_max:.0f}, range={final_range:.0f}")
+
+        return data_fixed
+
     def _extract_scanned_data(self, frame):
-        """extract the data generated by the STM like device"""
-        pass
+        """
+        Extract the data for a scanned frame (generated by AFM/STM).
+        """
+        # Store the position where we started reading the frame data
+        data_start_pos = self._file.tell()
+        logging.info(f"Starting to read scanned data at position: {data_start_pos}")
+
+        # Read axis scales (x, y, z)
+        self._extract_axis_scales(frame)
+
+        # Read the scanned data variables
+        frame.channel_index = self._file.read_uint8()
+        frame.mode = self._file.read_uint8()
+        frame.xres = self._file.read_uint16()
+        frame.yres = self._file.read_uint16()
+
+        logging.info(f"Channel {frame.channel_index}: xres={frame.xres}, yres={frame.yres}")
+
+        frame.ndacq = self._file.read_uint16()
+        frame.step_length = self._file.read_float32() * 1e-10
+        frame.adt = self._file.read_uint16()
+        frame.adc_gain_amp_log10 = self._file.read_uint8()
+        frame.adc_index = self._file.read_uint8()
+        frame.s16_version = self._file.read_uint8()
+        frame.s17_pass_num = self._file.read_uint8()
+        frame.scan_dir = self._file.read_uint8()
+        frame.power_of_2 = bool(self._file.read_uint8())
+        frame.velocity = self._file.read_float32() * 1e-10
+        frame.setpoint = self._file.read_float32() * 1e-9
+        frame.bias_voltage = self._file.read_float32()
+        frame.draw = bool(self._file.read_uint8())
+
+        # Skip one byte (reserved/padding)
+        self._file.shift_stream_position(1)
+
+        frame.xoff = self._file.read_int32()
+        frame.yoff = self._file.read_int32()
+        frame.nl_corr = bool(self._file.read_uint8())
+
+        # Read frame mode data (we don't actually need it for scanned frames)
+        frame.fm_mode = self._file.read_uint16()
+        frame.fm_xres = self._file.read_uint16()
+        frame.fm_yres = self._file.read_uint16()
+        frame.fm_ndots = self._file.read_uint16()
+
+        logging.info(f"fm_mode={frame.fm_mode}, fm_xres={frame.fm_xres}, fm_yres={frame.fm_yres}, fm_ndots={frame.fm_ndots}")
+
+        # Use xres/yres for image dimensions
+        image_width = frame.xres
+        image_height = frame.yres
+        image_size = image_width * image_height
+
+        # Calculate remaining bytes in frame
+        current_pos = self._file.tell()
+        remaining_bytes = frame.frm_byte_size - (current_pos - frame.frm_ptr_start)
+        logging.info(f"After frame mode: current_pos={current_pos}, remaining={remaining_bytes}")
+
+        if remaining_bytes > 0:
+            num_values = remaining_bytes // 2
+            raw_data = np.empty(num_values, dtype=np.int16)
+            for i in range(num_values):
+                raw_data[i] = self._file.read_int16()
+
+            # Fix overflow
+            raw_data_fixed = self.fix_overflow(raw_data)
+
+            # Use offset 184 for height (from your log)
+            offset = 184
+            image_data = raw_data_fixed[offset:offset + image_size]
+            image_2d = np.reshape(image_data, (image_height, image_width))
+
+            # Apply scan direction correction
+            #if frame.scan_dir & 0x01:
+             #   if not (frame.scan_dir & 0x02):
+             #       image_2d = np.fliplr(image_2d)
+            #else:
+             #   image_2d = image_2d.T
+             #   if not (frame.scan_dir & 0x04):
+             #       image_2d = np.flipud(image_2d)
+
+            #image_2d = np.flipud(image_2d)
+
+                        # ========== FIX XREAL AND YREAL ==========
+            # Get unit information for X and Y axes
+            x_unit_str, x_power10 = self._unit_to_string_and_power(frame.x_scale['unit'])
+            y_unit_str, y_power10 = self._unit_to_string_and_power(frame.y_scale['unit'])
+
+            # Calculate physical dimensions in meters
+            # The scale from the file is in the unit specified (e.g., nm, Å, µm)
+            # We need to convert to mkm
+            if x_unit_str == "nm":
+                x_step_m = abs(frame.x_scale['scale']) * 1e-3
+            elif x_unit_str == "Å":
+                x_step_m = abs(frame.x_scale['scale']) * 1e-4
+            elif x_unit_str == "µm":
+                x_step_m = abs(frame.x_scale['scale']) * 1
+            else:
+                x_step_m = abs(frame.x_scale['scale']) * (10 ** x_power10)
+
+            if y_unit_str == "nm":
+                y_step_m = abs(frame.y_scale['scale']) * 1e-3
+            elif y_unit_str == "Å":
+                y_step_m = abs(frame.y_scale['scale']) * 1e-4
+            elif y_unit_str == "µm":
+                y_step_m = abs(frame.y_scale['scale']) * 1
+            else:
+                y_step_m = abs(frame.y_scale['scale']) * (10 ** y_power10)
+
+            # Calculate total physical size
+            frame.xreal = image_width * x_step_m
+            frame.yreal = image_height * y_step_m
+
+            # Store the step sizes for reference
+            frame.xstep = x_step_m
+            frame.ystep = y_step_m
+
+            # Store unit strings
+            frame.xunit = x_unit_str
+            frame.yunit = y_unit_str
+
+            logging.info(f"X: step={x_step_m:.3e} m, total={frame.xreal:.3e} m ({frame.xreal*1e6:.3f} µm)")
+            logging.info(f"Y: step={y_step_m:.3e} m, total={frame.yreal:.3e} m ({frame.yreal*1e6:.3f} µm)")
+
+            # ========== Z SCALING ==========
+            # Get Z unit information
+            z_unit_str, z_power10 = self._unit_to_string_and_power(frame.z_scale['unit'])
+
+            # Scale in the file's units (in nm)
+            if z_unit_str == "nm":
+                scale_m_per_digit = abs(frame.z_scale['scale']) * 1e-4
+            elif z_unit_str == "Å":
+                scale_m_per_digit = abs(frame.z_scale['scale']) * 1e-10
+            elif z_unit_str == "µm":
+                scale_m_per_digit = abs(frame.z_scale['scale']) * 1e-3
+            else:
+                scale_m_per_digit = abs(frame.z_scale['scale']) * (10 ** z_power10)
+
+            # Apply the 16x scaling factor
+            actual_scale_m_per_digit = scale_m_per_digit / 16.0
+
+            # Calculate bias to center the data
+            raw_mean = np.mean(image_2d)
+            #calculated_bias = -actual_scale_m_per_digit * raw_mean  # This centers around zero
+
+            # Apply scaling
+            physical_data = actual_scale_m_per_digit * image_2d
+
+            # Store the data
+            frame.data = physical_data  # In meters
+            frame.data_um = physical_data * 1e6  # In micrometers
+            frame.zunit = z_unit_str
+
+            frame.title = self._get_frame_title(frame)
+
+            logging.info(f"Z scale: {scale_m_per_digit:.3e} m/digit (file), /16 = {actual_scale_m_per_digit:.3e} m/digit")
+            logging.info(f"Z range: {np.min(physical_data*1e6):.3f} to {np.max(physical_data*1e6):.3f} µm")
+            logging.info(f"Physical size: {frame.xreal*1e6:.3f} x {frame.yreal*1e6:.3f} µm")
+
+    def _get_frame_title(self, frame):
+        """Generate a proper title for the frame based on channel and mode"""
+        if frame.title and frame.title.strip():
+            return frame.title
+
+        # Try to get title from ADC mode
+        adc_mode_names = {
+            -1: "Off",
+            0: "Height",
+            1: "DFL",
+            2: "Lateral Force",
+            3: "Bias V",
+            4: "Current",
+            5: "FB Out",
+            6: "MAG",
+            7: "MAG Sin",
+            8: "MAG Cos",
+            9: "RMS",
+            10: "CalcMag",
+            11: "Phase1",
+            12: "Phase2",
+            13: "CalcPhase",
+            14: "Ex1",
+            15: "Ex2",
+            16: "HvX",
+            17: "HvY",
+            18: "Snap Back",
+        }
+
+        if hasattr(frame, 'channel_index') and frame.channel_index in adc_mode_names:
+            return f"{frame.channel_index+1}F:{adc_mode_names[frame.channel_index]}"
+
+        return f"Frame {frame.frm_ptr_start}"
+    # ... (rest of the code for title/XML)
+    def _unit_to_string_and_power(self, unit_code):
+        """
+        Convert unit code to string representation and power-of-10 scaling.
+        Returns (unit_string, power_of_10)
+        """
+        unit_map = {
+            -10: ("1/cm", 0),
+            -9: ("", 0),
+            -8: ("", 0),
+            -7: ("", 0),
+            -6: ("", 0),
+            -5: ("m", 0),      # meter
+            -4: ("cm", -2),     # centimeter
+            -3: ("mm", -3),     # millimeter
+            -2: ("µm", -6),     # micrometer
+            -1: ("nm", -9),     # nanometer
+            0: ("Å", -10),      # angstrom
+            1: ("nA", -9),      # nanoampere
+            2: ("V", 0),        # volt
+            3: ("", 0),
+            4: ("kHz", 3),      # kilohertz
+            5: ("deg", 0),
+            6: ("%", 0),
+            7: ("°C", 0),
+            8: ("V", 0),        # volt high
+            9: ("s", 0),        # second
+            10: ("ms", -3),     # millisecond
+            11: ("µs", -6),     # microsecond
+            12: ("ns", -9),     # nanosecond
+            13: ("counts", 0),
+            14: ("px", 0),
+            20: ("A", 0),       # ampere
+            21: ("mA", -3),     # milliampere
+            22: ("µA", -6),     # microampere
+            23: ("nA", -9),     # nanoampere
+            24: ("pA", -12),    # picoampere
+            25: ("V", 0),       # volt
+            26: ("mV", -3),     # millivolt
+            27: ("µV", -6),     # microvolt
+            28: ("nV", -9),     # nanovolt
+            29: ("pV", -12),    # picovolt
+            30: ("N", 0),       # newton
+            31: ("mN", -3),     # millinewton
+            32: ("µN", -6),     # micronewton
+            33: ("nN", -9),     # nanonewton
+            34: ("pN", -12),    # piconewton
+            1170: ("Hz", 0),    # hertz
+        }
+        return unit_map.get(unit_code, (f"unknown({unit_code})", 0))
+
+    def _extract_axis_scales(self, frame):
+        """
+        Extract axis scale information (x, y, z) as in the C function mdt_read_axis_scales.
+        Each axis has: offset (float32), step (float32), unit (int16)
+        """
+        # Initialize axis dictionaries
+        frame.x_scale = {}
+        frame.y_scale = {}
+        frame.z_scale = {}
+
+        # Clear and reinitialize dimensions list with 3 elements
+        frame.dimensions = [None, None, None]
+
+        # X axis
+        x_offset = self._file.read_float32()
+        x_step = abs(self._file.read_float32())  # Take absolute value as in C code
+        x_unit = self._file.read_int16()
+        frame.x_scale = {'bias': x_offset, 'scale': x_step, 'unit': x_unit}
+        frame.dimensions[0] = {'bias': x_offset, 'scale': x_step, 'unit': x_unit, 'name': 'X'}
+
+        # Y axis
+        y_offset = self._file.read_float32()
+        y_step = abs(self._file.read_float32())
+        y_unit = self._file.read_int16()
+        frame.y_scale = {'bias': y_offset, 'scale': y_step, 'unit': y_unit}
+        frame.dimensions[1] = {'bias': y_offset, 'scale': y_step, 'unit': y_unit, 'name': 'Y'}
+
+        # Z axis
+        z_offset = self._file.read_float32()
+        z_step = self._file.read_float32()
+        if z_step == 0:
+            z_step = 1.0
+            logging.warning("Z scale step was 0, set to 1.0")
+        z_unit = self._file.read_int16()
+        frame.z_scale = {'bias': z_offset, 'scale': z_step, 'unit': z_unit}
+
+        # Clear and reinitialize mesurands list with Z as the first element
+        frame.mesurands = []
+        frame.mesurands.append({'bias': z_offset, 'scale': z_step, 'unit': z_unit, 'name': 'Z'})
+        frame.nb_mesurands = 1
+
+        # Log the raw values
+        x_unit_str, x_power = self._unit_to_string_and_power(x_unit)
+        y_unit_str, y_power = self._unit_to_string_and_power(y_unit)
+        z_unit_str, z_power = self._unit_to_string_and_power(z_unit)
+
+        logging.debug(f"X axis: bias={x_offset:.6e} {x_unit_str}, scale={x_step:.6e} {x_unit_str} (power={x_power})")
+        logging.debug(f"Y axis: bias={y_offset:.6e} {y_unit_str}, scale={y_step:.6e} {y_unit_str} (power={y_power})")
+        logging.debug(f"Z axis: bias={z_offset:.6e} {z_unit_str}, scale={z_step:.6e} {z_unit_str} (power={z_power})")
+
+    def _unit_to_string(self, unit_code):
+        """
+        Convert unit code to string representation.
+        Based on the MDTUnit enum from MDTdeclaration.py
+        """
+        unit_map = {
+            -10: "1/cm", -9: "", -8: "", -7: "", -6: "",
+            -5: "m", -4: "cm", -3: "mm", -2: "µm", -1: "nm",
+            0: "Å", 1: "nA", 2: "V", 3: "", 4: "kHz",
+            5: "deg", 6: "%", 7: "°C", 8: "V", 9: "s",
+            10: "ms", 11: "µs", 12: "ns", 13: "", 14: "px",
+            20: "A", 21: "mA", 22: "µA", 23: "nA", 24: "pA",
+            25: "V", 26: "mV", 27: "µV", 28: "nV", 29: "pV",
+            30: "N", 31: "mN", 32: "µN", 33: "nN", 34: "pN",
+            1170: "Hz"
+        }
+        return unit_map.get(unit_code, f"unknown({unit_code})")
 
     def _extract_curve_data(self, frame):
         pass
@@ -713,7 +1172,7 @@ if __name__ == "__main__":
     import sys, os
     path = os.path.abspath(os.path.dirname(sys.argv[0]))
     print(path)
-     
+
     filenames = [
         #"test5.mdt",
         "f14h20-mica.mdt",
