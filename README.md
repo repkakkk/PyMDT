@@ -1,8 +1,10 @@
 # JupyterMDT
 
-This is a fork of PyMDT repository by [Sylvain Martin] (https://github.com/symartin)
+This is a fork of PyMDT repository by [Sylvain Martin](https://github.com/symartin)
 
 It can read MDT-files, make simple processing of frames and create quick .docx and .html digests
+
+Basic example can be found in '''mdt_processing_example_01.ipynb'''
 
 # PyMDT Readme
 
